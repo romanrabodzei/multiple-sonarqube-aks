@@ -39,13 +39,13 @@ Internet
 │  sonarqube-server-one namespace                         │
 │  ├─ StatefulSet / Pod (sonarqube-server-one-0)          │
 │  ├─ ClusterIP Service  (:9000)                          │
-│  ├─ Ingress (AGIC) → server-one-sq.<domain>             │
+│  ├─ Ingress (AGIC) → sonarqube-server-one.<domain>      │
 │  └─ SecretProviderClass → sonarqube-db-secret           │
 │                                                         │
 │  sonarqube-server-two namespace                         │
 │  ├─ StatefulSet / Pod (sonarqube-server-two-0)          │
 │  ├─ ClusterIP Service  (:9000)                          │
-│  ├─ Ingress (AGIC) → server-two-sq.<domain>             │
+│  ├─ Ingress (AGIC) → sonarqube-server-two.<domain>      │
 │  └─ SecretProviderClass → sonarqube-db-secret           │
 └─────────────────────────┬───────────────────────────────┘
                           │  PostgreSQL (private endpoint)
