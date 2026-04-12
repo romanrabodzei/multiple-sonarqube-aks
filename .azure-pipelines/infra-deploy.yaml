@@ -1,0 +1,142 @@
+# Pipeline: SonarQube AKS — Infrastructure Deployment (Bicep)
+# Deploys the SonarQube infrastructure to Azure using Bicep templates. 
+#
+# What this pipeline does:
+# 1. Validates the Bicep templates with linting and a What-If deployment to catch issues early.
+# 2. If validation succeeds and we're on the main branch, it proceeds to deploy the infrastructure to Azure.
+#
+# After this pipeline runs, you must run the ArgoCD deployment pipeline to deploy the SonarQube application onto the provisioned AKS cluster.
+# 
+# .NOTES
+#     Author     : Roman Rabodzei
+#     Version    : 1.0.260402
+#
+#            _
+#        .__(.)<  (MEOW)
+#         \___)
+# ~~~~~~~~~~~~~~~~~~~~~~~~
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - infra/**
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - infra/**
+
+# ── Variables ─────────────────────────────────────────────────────────────────
+variables:
+  azureServiceConnection: SonarQube-Infra-SC
+  deploymentLocation: westeurope
+  bicepFile: infra/main.bicep
+  bicepParamFile: infra/main.bicepparam
+
+# ── Stages ────────────────────────────────────────────────────────────────────
+stages:
+
+  # ── Stage 1: Validate ───────────────────────────────────────────────────────
+  - stage: Validate
+    displayName: Validate Bicep
+    jobs:
+      - job: BicepValidate
+        displayName: Lint and What-If
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Install Bicep CLI
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: az bicep install
+
+          - task: AzureCLI@2
+            displayName: Bicep Build (lint)
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: az bicep build --file $(bicepFile)
+
+          - task: AzureCLI@2
+            displayName: Deployment What-If
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                az deployment sub what-if `
+                  --location "$(deploymentLocation)" `
+                  --template-file "$(bicepFile)" `
+                  --parameters "$(bicepParamFile)" `
+                  --parameters deployedBy="$(Build.RequestedFor)"
+
+  # ── Stage 2: Deploy ─────────────────────────────────────────────────────────
+  - stage: Deploy
+    displayName: Deploy Infrastructure
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployBicep
+        displayName: Deploy Bicep to Azure
+        environment: sonarqube-infra
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: Install Bicep CLI
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    inlineScript: az bicep install
+
+                - task: AzureCLI@2
+                  displayName: Deploy Bicep
+                  name: BicepDeploy
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      $DEPLOYMENT_OUTPUT = az deployment sub create `
+                        --name "sonarqube-infra-$(Build.BuildNumber)" `
+                        --location "$(deploymentLocation)" `
+                        --template-file "$(bicepFile)" `
+                        --parameters "$(bicepParamFile)" `
+                        --parameters deployedBy="$(Build.RequestedFor)" `
+                        --query properties.outputs `
+                        --output json
+
+                      Write-Host "Deployment outputs:"
+                      Write-Host $DEPLOYMENT_OUTPUT
+
+                      # Export outputs as pipeline variables for downstream pipelines
+                      $outputs = $DEPLOYMENT_OUTPUT | ConvertFrom-Json
+                      $AKS_NAME = $outputs.azureKubernetesServiceName.value
+                      $INFRA_RG = $outputs.resourceGroupName.value
+                      $KV_NAME  = $outputs.keyVaultName.value
+                      $APG_NAME  = $outputs.applicationGatewayName.value
+
+                      Write-Host "##vso[task.setvariable variable=aksName;isOutput=true]$AKS_NAME"
+                      Write-Host "##vso[task.setvariable variable=infraRg;isOutput=true]$INFRA_RG"
+                      Write-Host "##vso[task.setvariable variable=keyVaultName;isOutput=true]$KV_NAME"
+                      Write-Host "##vso[task.setvariable variable=applicationGatewayName;isOutput=true]$APG_NAME"
+
+                      Write-Host "RG: $INFRA_RG | AKS: $AKS_NAME | KV: $KV_NAME | APG: $APG_NAME"

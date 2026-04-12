@@ -1,0 +1,261 @@
+# Pipeline: SonarQube AKS — ArgoCD Installation
+# Installs ArgoCD into the sonarqube-argocd namespace on AKS.
+# Run once (or to upgrade ArgoCD). Does NOT deploy SonarQube itself.
+#
+# What this pipeline does:
+#   1. Creates the sonarqube-argocd namespace
+#   2. Generates an RSA-4096 SSH key pair for repo access
+#   3. Stores the private key in Key Vault
+#   4. Installs ArgoCD via Helm (argo/argo-cd chart, pinned version)
+#   5. Registers the Azure DevOps Git repo in ArgoCD using the SSH key
+#   6. Applies the AGIC Ingress for the ArgoCD UI
+#
+# After this pipeline runs, you must:
+#   - Copy the SSH public key from Key Vault secret 'argocd-ssh-public-key'
+#     and add it to Azure DevOps:
+#     User Settings → SSH public keys  (or Project Settings → Repositories → Security)
+#   - Apply the app-of-apps: kubectl apply -f k8s/argocd/app-of-apps.yaml
+#
+# .NOTES
+#     Author  : Roman Rabodzei
+#     Version : 1.0.260402
+#
+#            _
+#        .__(.)<  (MEOW)
+#         \___)
+# ~~~~~~~~~~~~~~~~~~~~~~~~
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - k8s/argocd/**
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - k8s/argocd/**
+
+# ── Variables ─────────────────────────────────────────────────────────────────
+
+variables:
+  serviceConnection: "SonarQube-Infra-SC"
+  aksResourceGroup: "sonarqube-rg-001"
+  aksClusterName: "sonarqube-aks-001"
+  argoCDNamespace: "sonarqube-argocd"
+  argoCDChartVersion: "9.4.17"
+  adoRepoSSH: "git@ssh.dev.azure.com:v3/<organization>/<project>/sonarqube"
+
+# ── Stages ────────────────────────────────────────────────────────────────────
+stages:
+
+  # ── Stage 1: Resolve infra outputs ──────────────────────────────────────────────────
+  - stage: ResolveInfraOutputs
+    displayName: "Resolve infrastructure outputs"
+    jobs:
+      - job: GetOutputs
+        displayName: "Read Bicep deployment outputs"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: AzureCLI@2
+            name: infraOutputs
+            displayName: "Read Bicep outputs → pipeline variables"
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                DEPLOYMENT_NAME=$(az deployment sub list \
+                  --query "[?starts_with(name, 'sonarqube-infra-')] | sort_by(@, &properties.timestamp) | [-1].name" \
+                  -o tsv)
+
+                OUTPUTS=$(az deployment sub show \
+                  --name "$DEPLOYMENT_NAME" \
+                  --query properties.outputs \
+                  -o json)
+
+                KV_NAME=$(echo "$OUTPUTS"          | jq -r '.keyVaultName.value')
+                AG_NAME=$(echo "$OUTPUTS"          | jq -r '.applicationGatewayName.value')
+
+                echo "##vso[task.setvariable variable=KEYVAULT_NAME;isOutput=true]$KV_NAME"
+                echo "##vso[task.setvariable variable=AG_NAME;isOutput=true]$AG_NAME"
+                echo "Key Vault: $KV_NAME  |  App Gateway: $AG_NAME"
+
+  # ── Stage 2: Install ArgoCD ─────────────────────────────────────────────────────────
+  - stage: InstallArgoCD
+    displayName: "Install ArgoCD on AKS"
+    dependsOn: ResolveInfraOutputs
+    variables:
+      KEYVAULT_NAME: $[ stageDependencies.ResolveInfraOutputs.GetOutputs.outputs['infraOutputs.KEYVAULT_NAME'] ]
+      AG_NAME: $[ stageDependencies.ResolveInfraOutputs.GetOutputs.outputs['infraOutputs.AG_NAME'] ]
+    jobs:
+      - deployment: InstallArgoCD
+        displayName: "Install ArgoCD"
+        pool:
+          vmImage: ubuntu-latest
+        environment: sonarqube-infra
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                # ── AKS credentials ──────────────────────────────────────────
+                - task: AzureCLI@2
+                  displayName: "Get AKS credentials"
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az aks install-cli --only-show-errors
+                      az aks get-credentials \
+                        --resource-group $(aksResourceGroup) \
+                        --name $(aksClusterName) \
+                        --overwrite-existing
+                      kubelogin convert-kubeconfig -l azurecli
+
+                # ── Namespace ────────────────────────────────────────────────
+                - task: AzureCLI@2
+                  displayName: "Create sonarqube-argocd namespace"
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      kubectl apply -f k8s/argocd/namespace.yaml
+
+                # ── SSH key generation ───────────────────────────────────────
+                # Generates a repo-level ed25519 SSH key pair.
+                # Private key → Key Vault (argocd-ssh-private-key)
+                # Public key  → Key Vault (argocd-ssh-public-key) — copy to ADO manually
+                # If the secret already exists in Key Vault the existing key is reused
+                # (no key rotation unless you delete the KV secrets first).
+                - task: AzureCLI@2
+                  displayName: "Generate SSH key pair → Key Vault"
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      EXISTING=$(az keyvault secret show \
+                        --vault-name "$(KEYVAULT_NAME)" \
+                        --name argocd-ssh-private-key \
+                        --query value -o tsv 2>/dev/null || echo "")
+
+                      if [[ -n "$EXISTING" ]]; then
+                        echo "SSH key already exists in Key Vault — reusing."
+                        echo "$EXISTING" > /tmp/argocd_rsa
+                        chmod 600 /tmp/argocd_rsa
+                      else
+                        # Azure DevOps only accepts RSA keys (not ed25519).
+                        echo "Generating new RSA-4096 SSH key pair..."
+                        ssh-keygen -t rsa -b 4096 -C "argocd@erpforutilities" \
+                          -f /tmp/argocd_rsa -N ""
+
+                        az keyvault secret set \
+                          --vault-name "$(KEYVAULT_NAME)" \
+                          --name argocd-ssh-private-key \
+                          --file /tmp/argocd_rsa \
+                          --output none
+
+                        az keyvault secret set \
+                          --vault-name "$(KEYVAULT_NAME)" \
+                          --name argocd-ssh-public-key \
+                          --value "$(cat /tmp/argocd_rsa.pub)" \
+                          --output none
+
+                        echo ""
+                        echo "══════════════════════════════════════════════════"
+                        echo "ACTION REQUIRED — add this public key to Azure DevOps:"
+                        echo "User Settings → SSH public keys"
+                        echo "══════════════════════════════════════════════════"
+                        cat /tmp/argocd_rsa.pub
+                        echo "══════════════════════════════════════════════════"
+                      fi
+
+                # ── Helm install ArgoCD ──────────────────────────────────────
+                - task: AzureCLI@2
+                  displayName: "Helm install ArgoCD"
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      helm repo add argo https://argoproj.github.io/argo-helm
+                      helm repo update argo
+
+                      helm upgrade --install argocd argo/argo-cd \
+                        --namespace $(argoCDNamespace) \
+                        --values k8s/argocd/argocd-values.yaml \
+                        --version "$(argoCDChartVersion)" \
+                        --timeout 10m0s \
+                        --wait
+
+                      echo "ArgoCD installed. Waiting for server to be ready..."
+                      kubectl rollout status deployment/argocd-server \
+                        -n $(argoCDNamespace) --timeout=120s
+
+                # ── Register ADO repo in ArgoCD via SSH ──────────────────────
+                - task: AzureCLI@2
+                  displayName: "Register Azure DevOps repo in ArgoCD"
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      # Read private key from Key Vault
+                      az keyvault secret show \
+                        --vault-name "$(KEYVAULT_NAME)" \
+                        --name argocd-ssh-private-key \
+                        --query value -o tsv > /tmp/argocd_rsa
+                      chmod 600 /tmp/argocd_rsa
+
+                      # Create the ArgoCD repository secret directly as a K8s secret.
+                      # This avoids needing the argocd CLI and works without the UI.
+                      kubectl create secret generic argocd-repo-sonarqube \
+                        --namespace $(argoCDNamespace) \
+                        --from-literal=type=git \
+                        --from-literal=url=$(adoRepoSSH) \
+                        --from-file=sshPrivateKey=/tmp/argocd_rsa \
+                        --dry-run=client -o yaml | \
+                      kubectl label --local -f - \
+                        argocd.argoproj.io/secret-type=repository \
+                        -o yaml | \
+                      kubectl apply -f -
+
+                      rm -f /tmp/argocd_rsa
+                      echo "Repository secret registered in ArgoCD."
+
+                # ── Apply ArgoCD UI Ingress ──────────────────────────────────
+                - task: AzureCLI@2
+                  displayName: "Apply ArgoCD UI Ingress"
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      kubectl apply -f k8s/argocd/ingress.yaml
+
+                # ── Apply ArgoCD Applications ─────────────────────────────
+                - task: AzureCLI@2
+                  displayName: "Apply ArgoCD Applications"
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      kubectl apply -f k8s/argocd/app-of-apps.yaml

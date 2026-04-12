@@ -1,0 +1,53 @@
+# .Synopsis
+#     ArgoCD Application — sonarqube-server-two
+#
+# .NOTES
+#     Author  : Roman Rabodzei
+#     Version    : 1.0.260410
+#
+#             _
+#         .__(.)<  (MEOW)
+#          \___)
+#  ~~~~~~~~~~~~~~~~~~~~~~~~
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sonarqube-server-two
+  namespace: sonarqube-argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  sources:
+    - repoURL: git@ssh.dev.azure.com:v3/<organization>/<project>/sonarqube
+      targetRevision: main
+      path: k8s/helm/server-two
+      directory:
+        exclude: "chart-values.yaml"
+
+    - repoURL: https://SonarSource.github.io/helm-chart-sonarqube
+      chart: sonarqube
+      targetRevision: "2026.2.1"
+      helm:
+        releaseName: sonarqube
+        valueFiles:
+          - $values/k8s/helm/server-two/chart-values.yaml
+        parameters:
+          - name: monitoringPasscode
+            value: <generated_guid>
+
+    - repoURL: git@ssh.dev.azure.com:v3/<organization>/<project>/sonarqube
+      targetRevision: main
+      ref: values
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sonarqube-server-two
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

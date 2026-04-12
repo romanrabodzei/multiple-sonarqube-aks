@@ -1,0 +1,40 @@
+# .Synopsis
+#     Root Application — app-of-apps pattern
+#     Manages all SonarQube instance Applications by watching k8s/argocd/.
+#     Apply once manually after ArgoCD is installed:
+#       kubectl apply -f k8s/argocd/app-of-apps.yaml
+#
+#     ArgoCD then self-manages: any new app-*.yaml committed to k8s/argocd/
+#     is picked up automatically on the next sync (default poll: 3 min).
+#
+# .NOTES
+#     Author  : Roman Rabodzei
+#     Version    : 1.0.260410
+#
+#             _
+#         .__(.)<  (MEOW)
+#          \___)
+#  ~~~~~~~~~~~~~~~~~~~~~~~~
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sonarqube-apps
+  namespace: sonarqube-argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@ssh.dev.azure.com:v3/<organization>/<project>/sonarqube
+    targetRevision: main
+    path: k8s/argocd
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sonarqube-argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

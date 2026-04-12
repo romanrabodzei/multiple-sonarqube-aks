@@ -1,0 +1,102 @@
+# .Synopsis
+#     ArgoCD Helm values — sonarqube-argocd namespace
+#     Chart: argo/argo-cd  version: 9.4.17  (ArgoCD v3.3.6)
+#
+#     TLS is terminated at the Azure Application Gateway (AGIC).
+#     ArgoCD server runs in insecure (HTTP) mode — only port 80 is exposed internally.
+#     The AGIC Ingress in ingress.yaml handles the argocd-sq.erpforutilities.net hostname.
+#
+# .NOTES
+#     Author  : Roman Rabodzei
+#     Version    : 1.0.260410
+#
+#             _
+#         .__(.)<  (MEOW)
+#          \___)
+#  ~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+global:
+  domain: argocd.<domain> # Used in ArgoCD UI links to cluster resources.
+
+# ── ArgoCD server ─────────────────────────────────────────────────────────────
+server:
+  # Disable TLS inside the cluster — AGIC terminates it at the Application Gateway.
+  insecure: true
+  service:
+    type: ClusterIP
+  # Do not create the chart-bundled Ingress; we manage it ourselves in ingress.yaml.
+  ingress:
+    enabled: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+configs:
+  params:
+    # Required when running behind a TLS-terminating proxy (AGIC).
+    server.insecure: true
+
+  # ── Local users ───────────────────────────────────────────────────────────
+  # Add entries here to create local accounts.
+  # Passwords are set separately via: argocd account update-password --account <name>
+  # Available capabilities: apiKey (token generation), login (UI/CLI login)
+  cm:
+    # Note: ArgoCD local account names cannot contain dots — use underscores.
+    accounts.user_one: login
+    accounts.user_two: login
+
+  # ── RBAC ──────────────────────────────────────────────────────────────────
+  # Built-in roles: role:admin (full access), role:readonly (view only)
+  rbac:
+    policy.csv: |
+      g, user_one, role:admin
+      g, user_two, role:readonly
+
+  # ── SSH known hosts ────────────────────────────────────────────────────────
+  # ArgoCD repo server must trust the SSH host before it can clone from ADO.
+  # Without this entry the repo connection fails with "host key verification failed".
+  # Key obtained via: ssh-keyscan ssh.dev.azure.com
+  ssh:
+    knownHosts: |
+      ssh.dev.azure.com <kEY_TYPE> <KEY_VALUE>
+
+# ── Redis ─────────────────────────────────────────────────────────────────────
+redis:
+  enabled: true
+
+# ── Repo server ───────────────────────────────────────────────────────────────
+repoServer:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+# ── ApplicationSet controller ─────────────────────────────────────────────────
+applicationSet:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# ── Notifications controller ──────────────────────────────────────────────────
+notifications:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi

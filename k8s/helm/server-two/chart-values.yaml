@@ -1,0 +1,166 @@
+# .Synopsis
+#     SonarQube Community Edition
+#     Helm chart: https://github.com/SonarSource/helm-chart-sonarqube
+#     Chart: sonarqube/sonarqube  version: >=10.0.0
+#
+# .NOTES
+#     Author  : Roman Rabodzei
+#     Version    : 1.0.260410
+#
+#             _
+#         .__(.)<  (MEOW)
+#          \___)
+#  ~~~~~~~~~~~~~~~~~~~~~~~~
+
+# ── Name override — avoids 'sonarqube-sonarqube' doubling ─────────────────────
+fullnameOverride: sonarqube-server-two
+
+# ── Edition ───────────────────────────────────────────────────────────────────
+community:
+  enabled: true
+
+# ── Image (community branch plugin) ──────────────────────────────────────────
+# mc1arke image bundles the community branch plugin (multi-branch analysis).
+# The plugin JAR is also downloaded via plugins.install so it is available
+# in the chart-managed extensions/plugins emptyDir at runtime.
+image:
+  repository: mc1arke/sonarqube-with-community-branch-plugin
+  tag: 26.3.0.120487-community
+  pullPolicy: IfNotPresent
+
+# ── Plugins — chart init-container downloads JAR into extensions/plugins ──────
+# Must match the SonarQube version shipped in the image above.
+plugins:
+  install:
+    - "https://github.com/mc1arke/sonarqube-community-branch-plugin/releases/download/26.3.0/sonarqube-community-branch-plugin-26.3.0.jar"
+
+# ── Disable bundled PostgreSQL ────────────────────────────────────────────────
+postgresql:
+  enabled: false
+
+# ── External database (existing Azure PostgreSQL Flexible Server) ─────────────
+# Credentials are pulled from Key Vault via the CSI Secrets Store driver and
+# auto-created as K8s secret 'sonarqube-db-secret' by the SecretProviderClass.
+# The JDBC URL is assembled at pod start from SONAR_JDBC_HOST (see env below).
+jdbcOverwrite:
+  enabled: true
+  jdbcUrl: "" # assembled at runtime via SONAR_JDBC_URL env var
+  jdbcUsername: "" # populated from sonarqube-db-secret
+  jdbcSecretName: sonarqube-db-secret
+  jdbcSecretPasswordKey: jdbc-password
+
+env:
+  # JDBC URL assembled at runtime — avoids hardcoding the private FQDN in Git.
+  # SONAR_JDBC_HOST is resolved from Key Vault via the CSI-backed K8s secret.
+  - name: SONAR_JDBC_HOST
+    valueFrom:
+      secretKeyRef:
+        name: sonarqube-db-secret
+        key: postgres-host
+  - name: SONAR_JDBC_URL
+    value: "jdbc:postgresql://$(SONAR_JDBC_HOST):5432/sonarqube-server-two?sslmode=require"
+  - name: SONAR_JDBC_USERNAME
+    valueFrom:
+      secretKeyRef:
+        name: sonarqube-db-secret
+        key: jdbc-username
+  - name: SONAR_WEB_JAVAOPTS
+    value: "-Xms512m -Xmx1536m"
+  - name: SONAR_CE_JAVAOPTS
+    value: "-Xms512m -Xmx1024m"
+
+# ── Ingress ───────────────────────────────────────────────────────────────────
+# Disabled here — routing is handled by the AGIC Ingress in the
+ingress:
+  enabled: false
+
+# ── Service ───────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 9000
+
+# ── Persistence ───────────────────────────────────────────────────────────────
+# Disabled — SonarQube state (settings, projects, analyses) lives in PostgreSQL.
+# Elasticsearch indices (data/es8) are rebuilt from the DB on each pod start.
+# Azure Files SMB cannot be used for Elasticsearch data (no POSIX chmod support).
+persistence:
+  enabled: false
+
+# ── Extra volumes — CSI Secrets Store ────────────────────────────────────────
+# Mounting this CSI volume causes the driver to fetch secrets from Key Vault
+# and automatically create / rotate the 'sonarqube-db-secret' K8s secret.
+extraVolumes:
+  - name: sonarqube-secrets
+    csi:
+      driver: secrets-store.csi.k8s.io
+      readOnly: true
+      volumeAttributes:
+        secretProviderClass: sonarqube-db-secret-provider
+
+extraVolumeMounts:
+  - name: sonarqube-secrets
+    mountPath: /mnt/sonarqube-secrets
+    readOnly: true
+
+# ── Resource requests and limits ──────────────────────────────────────────────
+resources:
+  requests:
+    cpu: 400m
+    memory: 2Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+
+# ── Pod disruption budget ─────────────────────────────────────────────────────
+# minAvailable: 0 allows the single pod to be evicted during node maintenance.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 0
+
+# ── Startup probe ─────────────────────────────────────────────────────────────
+# Gives SonarQube up to 4 minutes (24 × 10s) to initialise before liveness
+# checks begin. Required because DB migration on first start can be slow.
+startupProbe:
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 24
+  timeoutSeconds: 1
+
+# ── Init containers ───────────────────────────────────────────────────────────
+# Security context applied to all chart-managed init containers (install-plugins,
+# configure-sysctl). initSysctl runs privileged to set kernel parameters.
+initContainers:
+  securityContext:
+    allowPrivilegeEscalation: false
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 0
+    seccompProfile:
+      type: RuntimeDefault
+    capabilities:
+      drop: ["ALL"]
+    readOnlyRootFilesystem: true
+
+initSysctl:
+  enabled: true
+  vmMaxMapCount: 524288 # Elasticsearch minimum requirement
+  fsFileMax: 131072
+  nofile: 131072
+  nproc: 8192
+  securityContext:
+    privileged: true
+    runAsUser: 0
+    readOnlyRootFilesystem: true
+
+# ── Security context ──────────────────────────────────────────────────────────
+securityContext:
+  fsGroup: 0
+containerSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 0
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  seccompProfile:
+    type: RuntimeDefault
+  capabilities:
+    drop: [ALL]

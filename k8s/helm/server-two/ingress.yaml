@@ -1,0 +1,42 @@
+# .Synopsis
+#     Ingress for sonarqube — managed by AGIC (Azure Application Gateway Ingress Controller)
+#
+#     AGIC reads real pod Endpoints from the ClusterIP service in this namespace
+#     and programs Application Gateway backend pools with actual pod IPs.
+# 
+#     TLS is handled at the Application Gateway level using a certificate uploaded
+#     directly to AG (sonarqube-wildcard). No K8s TLS secret is needed in this namespace.
+#     The cert is uploaded by the helm-deploy pipeline DeployIngress stage.
+#
+# .NOTES
+#     Author  : Roman Rabodzei
+#     Version    : 1.0.260410
+#
+#             _
+#         .__(.)<  (MEOW)
+#          \___)
+#  ~~~~~~~~~~~~~~~~~~~~~~~~
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sonarqube-server-two
+  namespace: sonarqube-server-two
+  annotations:
+    appgw.ingress.kubernetes.io/ssl-redirect: "true"
+    appgw.ingress.kubernetes.io/request-timeout: "300"
+    appgw.ingress.kubernetes.io/appgw-ssl-certificate: sonarqube-wildcard
+    appgw.ingress.kubernetes.io/rewrite-rule-set: sonarqube-cors-rewrite
+spec:
+  ingressClassName: azure-application-gateway
+  rules:
+    - host: sonarqube-server-two.<domain>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sonarqube-server-two
+                port:
+                  number: 9000
